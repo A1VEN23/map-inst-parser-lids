@@ -2,6 +2,10 @@ import os
 import re
 import json
 import subprocess
+import time
+import urllib.parse
+import urllib.request
+import html
 from datetime import datetime
 
 # ─────────────────────────────────────────────
@@ -51,7 +55,8 @@ PAIN_PHRASES = [
 # ─────────────────────────────────────────────
 class Lead:
     def __init__(self, name, tags, review_count, has_instagram, has_phone,
-                 has_website, has_online_booking, reviews=None, address="", city=""):
+                 has_website, has_online_booking, reviews=None, address="", city="",
+                 rating=0.0, phone_number="", instagram_url=""):
         self.name = name
         self.tags = tags                        # list[str] — OSM/2GIS категории
         self.review_count = review_count        # int
@@ -62,8 +67,12 @@ class Lead:
         self.reviews = reviews or []            # list[str] — тексты отзывов
         self.address = address
         self.city = city
+        self.rating = rating                    # float, например 4.2
+        self.phone_number = phone_number        # str, например "+7 (918) 123-45-67"
+        self.instagram_url = instagram_url      # str, например "@beauty_lira"
         self.score = 0
         self.pain_evidence = []
+        self.web_pain_snippets = []             # list[str] — цитаты из DuckDuckGo
 
 
 # ─────────────────────────────────────────────
@@ -123,7 +132,7 @@ def score_lead(lead: Lead) -> Lead:
 
 
 # ─────────────────────────────────────────────
-# [3] АНАЛИЗ БОЛИ В ОТЗЫВАХ
+# [3] АНАЛИЗ БОЛИ В ОТЗЫВАХ (локальные отзывы)
 # ─────────────────────────────────────────────
 def analyze_reviews(lead: Lead) -> Lead:
     evidence = []
@@ -134,6 +143,63 @@ def analyze_reviews(lead: Lead) -> Lead:
                 evidence.append(review_text.strip())
                 break  # одна фраза на отзыв достаточно
     lead.pain_evidence = evidence
+    return lead
+
+
+# ─────────────────────────────────────────────
+# [3b] ПОИСК БОЛИ ЧЕРЕЗ DUCKDUCKGO
+# ─────────────────────────────────────────────
+_DDG_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    )
+}
+
+
+def _ddg_search_snippets(query: str, max_results: int = 5) -> list:
+    """Возвращает список сниппетов из DuckDuckGo HTML-поиска."""
+    encoded = urllib.parse.quote_plus(query)
+    url = f"https://html.duckduckgo.com/html/?q={encoded}"
+    snippets = []
+    try:
+        req = urllib.request.Request(url, headers=_DDG_HEADERS)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        # Извлекаем текст сниппетов из класса result__snippet
+        raw_snippets = re.findall(
+            r'class=["\']result__snippet["\'][^>]*>(.*?)</(?:a|span)>',
+            body, re.DOTALL | re.IGNORECASE
+        )
+        for raw in raw_snippets[:max_results]:
+            clean = re.sub(r"<[^>]+>", "", raw)
+            clean = html.unescape(clean).strip()
+            if len(clean) > 20:
+                snippets.append(clean)
+    except Exception as exc:
+        print(f"    [DDG] Ошибка запроса: {exc}")
+    return snippets
+
+
+def fetch_web_pain(lead: Lead) -> Lead:
+    """Ищет плохие отзывы в интернете и сохраняет цитаты боли."""
+    query = f'{lead.name} {lead.city} отзывы не дозвониться не ответили'
+    print(f"    [DDG] Поиск: {query[:70]}...")
+    snippets = _ddg_search_snippets(query, max_results=8)
+    time.sleep(1.2)  # вежливая пауза между запросами
+
+    found = []
+    for snippet in snippets:
+        snippet_lower = snippet.lower()
+        for phrase in PAIN_PHRASES:
+            if phrase.lower() in snippet_lower:
+                found.append(snippet)
+                break
+        if len(found) >= 3:
+            break
+
+    lead.web_pain_snippets = found
     return lead
 
 
@@ -156,15 +222,43 @@ def process_leads(raw_leads: list) -> list:
         # Шаг 3: скоринг
         lead = score_lead(lead)
 
-        # Шаг 4: анализ боли
+        # Шаг 4: анализ боли (локальные отзывы)
         lead = analyze_reviews(lead)
 
+        # Шаг 5: поиск боли в интернете через DuckDuckGo
+        lead = fetch_web_pain(lead)
+
         qualified.append(lead)
-        print(f"  [OK][score={lead.score}] {lead.name} | pain={len(lead.pain_evidence)}")
+        print(f"  [OK][score={lead.score}] {lead.name} | pain_local={len(lead.pain_evidence)} | pain_web={len(lead.web_pain_snippets)}")
 
     # Сортировка по убыванию score
     qualified.sort(key=lambda l: l.score, reverse=True)
     return qualified
+
+
+# ─────────────────────────────────────────────
+# ГЕНЕРАЦИЯ ОФФЕРА НА ОСНОВЕ БОЛИ
+# ─────────────────────────────────────────────
+def _build_offer(lead: Lead) -> str:
+    all_pain = lead.pain_evidence + lead.web_pain_snippets
+    if not all_pain:
+        pain_desc = "отсутствие онлайн-записи и слабую коммуникацию с клиентами"
+    else:
+        sample = all_pain[0].lower()
+        if any(p in sample for p in ["не дозвониться", "не берут трубку", "звонил"]):
+            pain_desc = "потери клиентов из-за пропущенных звонков"
+        elif any(p in sample for p in ["игнор", "директ", "написал"]):
+            pain_desc = "игнорирование сообщений в директе"
+        elif any(p in sample for p in ["не ответили", "не отвечают", "тишина"]):
+            pain_desc = "отсутствие ответов на заявки клиентов"
+        else:
+            pain_desc = "слабую коммуникацию с клиентами"
+
+    return (
+        f'"Я увидел, что клиенты жалуются на {pain_desc}. '
+        f"Я — разработчик, внедрю вам ИИ-звонаря или менеджера переписок за отзыв, "
+        f'чтобы вы перестали терять эти деньги. Интересно?"'
+    )
 
 
 # ─────────────────────────────────────────────
@@ -180,28 +274,43 @@ def generate_report(leads: list, path: str = "SECRET_LEADS.md"):
         "",
     ]
 
-    for i, lead in enumerate(leads, 1):
-        priority_tag = "🔥 ПРИОРИТЕТ" if (
-            lead.has_instagram and lead.has_phone
-            and not lead.has_website and not lead.has_online_booking
-        ) else ""
+    for lead in leads:
+        stars = f"⭐ {lead.rating:.1f}" if lead.rating else "⭐ —"
+        contact_phone = lead.phone_number or ("есть" if lead.has_phone else "—")
+        contact_insta = lead.instagram_url or ("есть" if lead.has_instagram else "—")
+        web_str = "есть" if lead.has_website else "нет сайта"
 
-        lines.append(f"## {i}. {lead.name}  {priority_tag}")
-        lines.append(f"- **Адрес:** {lead.address or '—'}")
-        lines.append(f"- **Город:** {lead.city or '—'}")
-        lines.append(f"- **Теги:** {', '.join(lead.tags) or '—'}")
-        lines.append(f"- **Отзывов:** {lead.review_count}")
-        lines.append(f"- **Instagram:** {'✅' if lead.has_instagram else '❌'}")
-        lines.append(f"- **Телефон:** {'✅' if lead.has_phone else '❌'}")
-        lines.append(f"- **Сайт:** {'✅' if lead.has_website else '❌'}")
-        lines.append(f"- **Онлайн-запись:** {'✅' if lead.has_online_booking else '❌'}")
-        lines.append(f"- **Score:** {lead.score}")
+        lines.append(f"### 🏢 {lead.name} — {stars} ({lead.review_count} отз.)")
+        lines.append(f"**📍 Адрес:** {lead.address or '—'}, {lead.city or '—'}")
+        lines.append(
+            f"**📞 Контакт:** {contact_phone} | "
+            f"**🌐 Сайт/Инста:** {contact_insta} ({web_str})"
+        )
+        lines.append("")
 
-        if lead.pain_evidence:
-            lines.append(f"- **Доказательства боли:**")
-            for ev in lead.pain_evidence:
-                lines.append(f'  > "{ev}"')
+        # Собираем все цитаты боли
+        all_pain = lead.pain_evidence + lead.web_pain_snippets
+        if all_pain:
+            lines.append("> **⚠️ НАЙДЕННАЯ БОЛЬ (ЦИТАТЫ):**")
+            for ev in all_pain[:3]:
+                lines.append(f'> - "{ev}"')
+        else:
+            # Структурная боль — нет сайта / нет онлайн-записи
+            structural = []
+            if not lead.has_website:
+                structural.append("На сайте нет формы онлайн-записи (сайта нет вообще)")
+            if not lead.has_online_booking:
+                structural.append("Нет онлайн-записи через Yclients/Dikidi")
+            if structural:
+                lines.append("> **⚠️ СТРУКТУРНАЯ БОЛЬ:**")
+                for s in structural:
+                    lines.append(f'> - "{s}"')
 
+        lines.append("")
+        lines.append(f"**💰 НАШ ОФФЕР:**")
+        lines.append(_build_offer(lead))
+        lines.append("")
+        lines.append("---")
         lines.append("")
 
     report_text = "\n".join(lines)
@@ -223,7 +332,7 @@ def git_push(repo_dir: str, commit_message: str):
     commands = [
         ["git", "add", "."],
         ["git", "commit", "-m", commit_message],
-        ["git", "push", "origin", "main"],
+        ["git", "push", "origin", "master"],
     ]
     for cmd in commands:
         print(f"\n[GIT] {' '.join(cmd)}")
@@ -257,6 +366,9 @@ DEMO_LEADS = [
         ],
         address="ул. Ленина, 14",
         city="Краснодар",
+        rating=4.3,
+        phone_number="+7 (861) 200-11-22",
+        instagram_url="@lira_beauty_krd",
     ),
     # Должен пройти — стоматология с болью
     Lead(
@@ -273,6 +385,9 @@ DEMO_LEADS = [
         ],
         address="пр. Мира, 8",
         city="Ростов-на-Дону",
+        rating=4.1,
+        phone_number="+7 (863) 300-44-55",
+        instagram_url="@dental_plus_rostov",
     ),
     # Должен пройти — автосервис
     Lead(
@@ -286,6 +401,8 @@ DEMO_LEADS = [
         reviews=["Хорошо сделали, цена норм"],
         address="ул. Гагарина, 22",
         city="Воронеж",
+        rating=4.0,
+        phone_number="+7 (473) 111-22-33",
     ),
     # ДОЛЖЕН БЫТЬ ОТФИЛЬТРОВАН — чёрный список
     Lead(
@@ -338,6 +455,9 @@ DEMO_LEADS = [
         reviews=["Не ответили на заявку уже 3 дня"],
         address="бул. Цветной, 5",
         city="Казань",
+        rating=4.6,
+        phone_number="+7 (843) 500-66-77",
+        instagram_url="@svet_photo_kzn",
     ),
     # Должен пройти — мебельный
     Lead(
@@ -351,6 +471,9 @@ DEMO_LEADS = [
         reviews=["Не берут трубку, пришлось ехать лично"],
         address="ул. Строителей, 33",
         city="Нижний Новгород",
+        rating=3.9,
+        phone_number="+7 (831) 400-88-99",
+        instagram_url="@uyut_mebel_nn",
     ),
     # ДОЛЖЕН БЫТЬ ОТФИЛЬТРОВАН — государственный
     Lead(
@@ -394,8 +517,7 @@ def main():
         print(f"\n[INFO] Найдено {len(qualified_leads)} лидов (≥{QUALITY_THRESHOLD}) — запускаю git push...")
         repo_dir = os.path.dirname(os.path.abspath(__file__))
         commit_msg = (
-            "Fix: Removed low-value leads (cafeterias), "
-            "added niche filters and review pain analysis"
+            "Update: Added stars, review snippets and tailored offers"
         )
         success = git_push(repo_dir, commit_msg)
         if success:
